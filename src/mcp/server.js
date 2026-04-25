@@ -46,6 +46,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { HubState } from "../utils/sse-manager.js";
 import logger from "../utils/logger.js";
+import { isToolAllowed } from "../utils/tool-policy.js";
 
 // Unique server name to identify our internal MCP endpoint
 const HUB_INTERNAL_SERVER_NAME = "mcp-hub-internal-endpoint";
@@ -236,7 +237,9 @@ export class MCPServerEndpoint {
 
       // Setup call/action handler if schema exists
       if (capType.handler?.callSchema) {
-        server.setRequestHandler(capType.handler.callSchema, async (request, extra) => {
+        server.setRequestHandler(capType.handler.callSchema, async (request) => {
+
+          const key = request.params[capType.uidField];
 
           const registeredCap = this.getRegisteredCapability(request, capType.id, capType.uidField);
           if (!registeredCap) {
@@ -246,6 +249,17 @@ export class MCPServerEndpoint {
             );
           }
           const { serverName, originalName } = registeredCap;
+
+          if (
+            capId === CAPABILITY_TYPES.TOOLS.id
+            && !this.isToolAllowedForServer(serverName, originalName)
+          ) {
+            throw new McpError(
+              ErrorCode.InvalidParams,
+              `Tool is disabled by policy: ${key}`,
+            );
+          }
+
           const request_options = {
             timeout: MCP_REQUEST_TIMEOUT
           }
@@ -281,6 +295,15 @@ export class MCPServerEndpoint {
       }
     }
     return registeredCap
+  }
+
+  isToolAllowedForServer(serverName, toolName) {
+    const connection = this.mcpHub.getConnection(serverName);
+    if (!connection) {
+      return false;
+    }
+
+    return isToolAllowed(connection.config, toolName);
   }
 
   /**
@@ -430,6 +453,14 @@ export class MCPServerEndpoint {
     // Register each capability with namespaced name
     for (const cap of capabilities) {
       const originalValue = cap[capType.uidField];
+
+      if (
+        capabilityId === CAPABILITY_TYPES.TOOLS.id
+        && !isToolAllowed(connection.config, originalValue)
+      ) {
+        continue;
+      }
+
       const uniqueName = serverId + DELIMITER + originalValue;
 
       // Create capability with namespaced unique identifier
@@ -580,4 +611,3 @@ export class MCPServerEndpoint {
     logger.info('MCP server endpoint closed');
   }
 }
-

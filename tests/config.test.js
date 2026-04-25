@@ -118,6 +118,60 @@ describe("ConfigManager", () => {
       expect(fs.readFile).toHaveBeenCalledWith("/path/to/config.json", "utf-8");
     });
 
+    it("should detect tool policy fields as config modifications", async () => {
+      const baselineConfig = {
+        mcpServers: {
+          test: {
+            command: "node",
+            args: ["server.js"],
+          },
+        },
+      };
+      const updatedConfig = {
+        mcpServers: {
+          test: {
+            command: "node",
+            args: ["server.js"],
+            disabled_tools: ["foo"],
+          },
+        },
+      };
+
+      vi.spyOn(fs, "readFile")
+        .mockResolvedValueOnce(JSON.stringify(baselineConfig))
+        .mockResolvedValueOnce(JSON.stringify(updatedConfig));
+
+      configManager = new ConfigManager("/path/to/config.json");
+      await configManager.loadConfig();
+      const { changes } = await configManager.loadConfig();
+
+      expect(changes.modified).toEqual(["test"]);
+      expect(changes.details.test.modifiedFields).toContain("disabled_tools");
+    });
+
+    it("should not mark unchanged policy arrays as modified", async () => {
+      const configWithPolicy = {
+        mcpServers: {
+          test: {
+            command: "node",
+            args: ["server.js"],
+            disabled_tools: ["foo"],
+          },
+        },
+      };
+
+      vi.spyOn(fs, "readFile")
+        .mockResolvedValueOnce(JSON.stringify(configWithPolicy))
+        .mockResolvedValueOnce(JSON.stringify(configWithPolicy));
+
+      configManager = new ConfigManager("/path/to/config.json");
+      await configManager.loadConfig();
+      const { changes } = await configManager.loadConfig();
+
+      expect(changes.modified).toEqual([]);
+      expect(changes.unchanged).toEqual(["test"]);
+    });
+
     it("should throw error if no config path specified", async () => {
       configManager = new ConfigManager();
       await expect(configManager.loadConfig()).rejects.toThrow(

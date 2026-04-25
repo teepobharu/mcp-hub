@@ -7,6 +7,7 @@ import {
   ConfigError,
   wrapError,
 } from "./utils/errors.js";
+import { isToolPolicyOnlyChange } from "./utils/tool-policy.js";
 import EventEmitter from "events";
 
 export class MCPHub extends EventEmitter {
@@ -191,6 +192,18 @@ export class MCPHub extends EventEmitter {
       const modifiedPromises = changes.modified.map(async (name) => {
         const serverConfig = newConfig.mcpServers[name];
         const connection = this.connections.get(name);
+        const changeDetails = changes.details?.[name] || {};
+        const modifiedFields = changeDetails.modifiedFields || [];
+
+        if (
+          connection &&
+          isToolPolicyOnlyChange(modifiedFields, changeDetails.oldValues, changeDetails.newValues)
+        ) {
+          connection.config = serverConfig;
+          logger.info(`Updated tool policy for server '${name}'`)
+          return;
+        }
+
         if (!!serverConfig.disabled !== !!connection?.disabled) {
           if (serverConfig.disabled) {
             await this.stopServer(name, true)
@@ -426,4 +439,3 @@ export class MCPHub extends EventEmitter {
 }
 
 export { MCPConnection } from "./MCPConnection.js";
-

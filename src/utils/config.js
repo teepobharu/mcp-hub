@@ -6,9 +6,22 @@ import JSON5 from "json5";
 import logger from "./logger.js";
 import { ConfigError, wrapError } from "./errors.js";
 import deepEqual from "fast-deep-equal";
+import { TOOL_POLICY_FIELDS } from "./tool-policy.js";
 export class ConfigManager extends EventEmitter {
   // Key fields to compare for server config changes
-  #KEY_FIELDS = ['command', 'args', 'env', 'disabled', 'url', 'headers', 'dev', 'name', 'cwd', 'config_source'];
+  #KEY_FIELDS = [
+    'command',
+    'args',
+    'env',
+    'disabled',
+    'url',
+    'headers',
+    'dev',
+    'name',
+    'cwd',
+    'config_source',
+    ...TOOL_POLICY_FIELDS,
+  ];
   #previousConfig = null;
   #watcher = null;
 
@@ -88,10 +101,17 @@ export class ConfigManager extends EventEmitter {
           if (!oldServers[name].hasOwnProperty(field) || !newConfig.hasOwnProperty(field)) {
             return true;
           }
-          if (field === 'args' || field === 'env' || field === 'headers' || field === 'dev') {
-            return !deepEqual(oldServers[name][field], newConfig[field]);
+
+          const oldValue = oldServers[name][field];
+          const newValue = newConfig[field];
+          if (
+            (oldValue !== null && typeof oldValue === 'object')
+            || (newValue !== null && typeof newValue === 'object')
+          ) {
+            return !deepEqual(oldValue, newValue);
           }
-          return oldServers[name][field] !== newConfig[field];
+
+          return oldValue !== newValue;
         });
 
         if (modifiedFields.length > 0) {
