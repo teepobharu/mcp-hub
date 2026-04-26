@@ -113,6 +113,11 @@ The Hub automatically:
   - Real-time workspace updates via SSE events
   - API endpoints to list and monitor active workspaces
 
+## Documentation
+
+- Architecture Decision Records (ADR): `docs/adr/`
+  - `docs/adr/0001-tool-policy-enforcement.md`
+
 ### Components
 
 #### Hub Server
