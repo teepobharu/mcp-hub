@@ -51,6 +51,11 @@ class StorageManager {
     serversStorage[serverUrl] = { ...serverData, ...data };
     return this.save();
   }
+
+  async clear(serverUrl) {
+    serversStorage[serverUrl] = { clientInfo: null, tokens: null, codeVerifier: null };
+    return this.save();
+  }
 }
 
 // Singleton instance
@@ -118,5 +123,10 @@ export default class MCPHubOAuthProvider {
   async codeVerifier() {
     logger.file(`[${this.serverName}] Getting Code verifier`);
     return storage.get(this.serverUrl).codeVerifier;
+  }
+
+  async clearAuth() {
+    logger.file(`[${this.serverName}] Clearing stored OAuth credentials`);
+    return storage.clear(this.serverUrl);
   }
 }

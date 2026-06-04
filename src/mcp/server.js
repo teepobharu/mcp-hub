@@ -517,10 +517,17 @@ export class MCPServerEndpoint {
 
     let clientInfo
 
+    let cleanedUp = false;
 
     // Setup cleanup on close
     const cleanup = async () => {
+      if (cleanedUp) {
+        return;
+      }
+      cleanedUp = true;
       this.clients.delete(sessionId);
+      res.off("close", cleanup);
+      transport.onclose = undefined;
       try {
         await server.close();
       } catch (error) {

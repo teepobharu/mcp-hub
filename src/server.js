@@ -15,6 +15,7 @@ import {
 } from "./utils/errors.js";
 import { getMarketplace } from "./marketplace.js";
 import { MCPServerEndpoint } from "./mcp/server.js";
+import { MCPProxyEndpoint } from "./mcp/proxy.js";
 import { WorkspaceCacheManager } from "./utils/workspace-cache.js";
 
 const SERVER_ID = "mcp-hub";
@@ -38,6 +39,7 @@ function getStatusCode(error) {
 let serviceManager = null;
 let marketplace = null;
 let mcpServerEndpoint = null;
+let mcpProxyEndpoint = null;
 
 class ServiceManager {
   constructor(options = {}) {
@@ -164,6 +166,17 @@ class ServiceManager {
       logger.info(`Hub endpoint ready: Use \`${mcpServerEndpoint.getEndpointUrl()}\` endpoint with any other MCP clients`);
     } catch (error) {
       logger.error("MCP_ENDPOINT_INIT_ERROR", "Failed to initialize MCP server endpoint", {
+        error: error.message
+      }, false);
+    }
+
+    // Initialize lean proxy endpoint (meta-tools only — saves context for clients
+    // that prefer on-demand discovery over flat tool exposure).
+    try {
+      mcpProxyEndpoint = new MCPProxyEndpoint(this.mcpHub);
+      logger.info(`Hub lean proxy ready: Use \`${mcpProxyEndpoint.getEndpointUrl()}\` for context-light meta-tool access`);
+    } catch (error) {
+      logger.error("MCP_PROXY_INIT_ERROR", "Failed to initialize MCP proxy endpoint", {
         error: error.message
       }, false);
     }
@@ -304,6 +317,16 @@ class ServiceManager {
       }
     }
 
+    // Close MCP lean proxy endpoint
+    if (mcpProxyEndpoint) {
+      try {
+        await mcpProxyEndpoint.close();
+        mcpProxyEndpoint = null;
+      } catch (error) {
+        logger.debug(`Error closing MCP proxy endpoint: ${error.message}`);
+      }
+    }
+
     //INFO:Sometimes this might take some time, keeping the process alive, this might cause issue when restarting 
     //INFO: MUST catch the error here to avoid unhandled rejection, which will again call shutdown() leading to infinite loop
     this.stopServer().catch((error) => {
@@ -368,6 +391,36 @@ app.post("/messages", async (req, res) => {
     logger.warn('Failed to handle MCP message');
     if (!res.headersSent) {
       res.status(500).send('Error handling MCP message');
+    }
+  }
+});
+
+// Register MCP lean proxy endpoints — context-light meta-tool surface.
+// Coexists with /mcp; clients pick one or the other.
+app.get("/mcp-lean", async (req, res) => {
+  try {
+    if (!mcpProxyEndpoint) {
+      throw new ServerError("MCP proxy endpoint not initialized");
+    }
+    await mcpProxyEndpoint.handleSSEConnection(req, res);
+  } catch (error) {
+    logger.warn(`Failed to setup MCP lean SSE connection: ${error.message}`);
+    if (!res.headersSent) {
+      res.status(500).send('Error establishing MCP lean connection');
+    }
+  }
+});
+
+app.post("/messages-lean", async (req, res) => {
+  try {
+    if (!mcpProxyEndpoint) {
+      throw new ServerError("MCP proxy endpoint not initialized");
+    }
+    await mcpProxyEndpoint.handleMCPMessage(req, res);
+  } catch (error) {
+    logger.warn('Failed to handle MCP lean message');
+    if (!res.headersSent) {
+      res.status(500).send('Error handling MCP lean message');
     }
   }
 });
@@ -525,6 +578,9 @@ registerRoute("GET", "/health", "Check server health", async (req, res) => {
   if (mcpServerEndpoint) {
     healthData.mcpEndpoint = mcpServerEndpoint.getStats();
   }
+  if (mcpProxyEndpoint) {
+    healthData.mcpLeanEndpoint = mcpProxyEndpoint.getStats();
+  }
 
   // Add workspace information if available
   if (serviceManager?.workspaceCache) {
@@ -598,10 +654,15 @@ registerRoute("POST", "/restart", "Restart MCP Hub", async (req, res) => {
 // For usual restarts use the /restart endpoint
 registerRoute("POST", "/hard-restart", "Hard Restart MCP Hub", async (req, res) => {
   try {
-
+    let shouldShutdown = false;
     if (serviceManager.mcpHub) {
       serviceManager.setState(HubState.RESTARTING)
-      process.emit('SIGTERM')
+      shouldShutdown = true;
+    }
+    if (shouldShutdown) {
+      res.once("finish", () => {
+        setImmediate(() => process.emit('SIGTERM'));
+      });
     }
     res.json({
       status: "ok",
@@ -777,6 +838,39 @@ registerRoute(
       res.json(result);
     } catch (error) {
       throw wrapError(error, "OPEN_REQUEST_ERROR", error.data || {});
+    }
+  }
+)
+
+// Clear stored OAuth credentials for a server so the next auth attempt triggers fresh DCR.
+// Useful when the upstream MCP server loses its client registry (pod restart / in-memory DCR),
+// causing "client ID not found in registry" on the consent page.
+// After clearing, reconnect the server to start a new auth flow.
+registerRoute(
+  "POST",
+  "/servers/clear-auth",
+  "Clear stored OAuth credentials for a server",
+  async (req, res) => {
+    const { server_name } = req.body;
+    try {
+      if (!server_name) {
+        throw new ValidationError("Missing server name", { field: "server_name" });
+      }
+      const connection = serviceManager.mcpHub.getConnection(server_name);
+      if (connection.authProvider) {
+        await connection.authProvider.clearAuth();
+      }
+      await connection.disconnect();
+      serviceManager.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
+        changes: { modified: [server_name] },
+      });
+      res.json({
+        status: "ok",
+        server_name,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      throw wrapError(error, "CLEAR_AUTH_ERROR", error.data || {});
     }
   }
 )
