@@ -7,7 +7,8 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { UnauthorizedError } from "@modelcontextprotocol/sdk/client/auth.js";
 import ReconnectingEventSource from "reconnecting-eventsource";
-import MCPHubOAuthProvider from "./utils/oauth-provider.js"
+import MCPHubOAuthProvider, { resolveOAuthRedirectStyle } from "./utils/oauth-provider.js"
+import { spawn } from "child_process";
 import {
   ListToolsResultSchema,
   ListResourcesResultSchema,
@@ -47,9 +48,10 @@ const CLIENT_CONNECT_TIMEOUT = 5 * 60000 //5 minutes
 
 
 export class MCPConnection extends EventEmitter {
-  constructor(name, config, marketplace, hubServerUrl) {
+  constructor(name, config, marketplace, hubServerUrl, hubOptions = {}) {
     super();
     this.name = name; // Keep as mcpId
+    this.hubOptions = hubOptions || {};
 
     // OAuth state
     this.authProvider = null;
@@ -90,6 +92,8 @@ export class MCPConnection extends EventEmitter {
     this.lastStarted = null;
     this.disabled = config.disabled || false;
     this.authorizationUrl = null;
+    this.authCommand = null;
+    this.authProcess = null;
     this.hubServerUrl = hubServerUrl;
     this.serverInfo = null; // Will store server's reported name/version
 
@@ -209,6 +213,10 @@ export class MCPConnection extends EventEmitter {
           }
         }
       } catch (error) {
+        if (this.transportType === 'stdio' && this._isManualAuthError(error)) {
+          await this._handleManualAuthRequired(error);
+          return;
+        }
         logger.debug(`'${this.name}' failed to start connection: ${error.message}`);
         throw error
       }
@@ -570,6 +578,8 @@ export class MCPConnection extends EventEmitter {
     this.lastStarted = null;
     this.disabled = this.config.disabled || false;
     this.authorizationUrl = null;
+    this.authCommand = null;
+    this.authProcess = null;
     this.authProvider = null;
     this.serverInfo = null;
   }
@@ -603,13 +613,21 @@ export class MCPConnection extends EventEmitter {
     return new MCPHubOAuthProvider({
       serverName: this.name,
       serverUrl: this.config.url,
-      hubServerUrl: this.hubServerUrl
+      hubServerUrl: this.hubServerUrl,
+      redirectStyle: resolveOAuthRedirectStyle({
+        serverUrl: this.config.url,
+        config: this.config,
+        hubOAuth: this.hubOptions.oauth || {},
+      }),
     })
   }
 
   async authorize() {
     if (!this.authorizationUrl) {
-      throw new Error(`No authorization URL available for server '${this.name}'`);
+      if (this.config.authCommand) {
+        return await this._runManualAuthCommand();
+      }
+      throw new Error(`No authorization URL or auth command available for server '${this.name}'`);
     }
     //validate
     new URL(this.authorizationUrl)
@@ -655,6 +673,7 @@ export class MCPConnection extends EventEmitter {
       uptime: this.getUptime(),
       lastStarted: this.lastStarted,
       authorizationUrl: this.authorizationUrl,
+      authCommand: this.authCommand,
       serverInfo: this.serverInfo, // Include server's reported name/version
       config_source: this.config.config_source, // Include which config file this server came from
     };
@@ -765,6 +784,146 @@ export class MCPConnection extends EventEmitter {
 
   _isAuthError(error) {
     return error.code === 401 || error instanceof UnauthorizedError
+  }
+
+  _isManualAuthError(error) {
+    if (!this.config.authCommand) {
+      return false;
+    }
+    const message = error?.message || "";
+    return /auth(entication|orization)? required/i.test(message);
+  }
+
+  async _resolveManualAuthCommand() {
+    if (!this.config.authCommand) {
+      return null;
+    }
+    if (typeof this.config.authCommand === "string") {
+      return {
+        command: this.config.authCommand,
+        args: [],
+        cwd: this.config.cwd,
+        env: this.config.env || {},
+      };
+    }
+    if (typeof this.config.authCommand === "object") {
+      return await envResolver.resolveConfig(this.config.authCommand, [
+        "env",
+        "args",
+        "command",
+        "cwd",
+      ]);
+    }
+    throw new ServerError("Invalid authCommand config", {
+      server: this.name,
+      authCommand: this.config.authCommand,
+    });
+  }
+
+  async _handleManualAuthRequired(error) {
+    logger.warn(`Server '${this.name}' requires manual authorization`);
+    this.removeNotificationHandlers();
+    if (this.transport) {
+      try {
+        await this.transport.close();
+      } catch (closeError) {
+        logger.debug(`'${this.name}': Error closing unauthorized stdio transport: ${closeError.message}`);
+      }
+    }
+    this.client = null;
+    this.transport = null;
+    this.tools = [];
+    this.resources = [];
+    this.prompts = [];
+    this.resourceTemplates = [];
+    this.status = ConnectionStatus.UNAUTHORIZED;
+    this.error = error.message;
+    this.startTime = null;
+    this.authorizationUrl = null;
+    this.authProvider = null;
+    this.serverInfo = null;
+    this.authCommand = await this._resolveManualAuthCommand();
+  }
+
+  async _runManualAuthCommand() {
+    const authCommand = await this._resolveManualAuthCommand();
+    if (!authCommand || !authCommand.command) {
+      throw new ServerError("No auth command available", { server: this.name });
+    }
+    if (this.authProcess) {
+      return {
+        authCommand,
+        message: `Manual authorization already running for server '${this.name}'`,
+      };
+    }
+    const args = Array.isArray(authCommand.args) ? authCommand.args : [];
+    logger.info(`Starting manual auth command for server '${this.name}'`, {
+      server: this.name,
+      command: authCommand.command,
+      args,
+    });
+    const child = spawn(authCommand.command, args, {
+      cwd: authCommand.cwd || process.cwd(),
+      env: {
+        ...process.env,
+        ...(authCommand.env || {}),
+      },
+      stdio: "ignore",
+    });
+    this.authProcess = child;
+    child.once("exit", async (code, signal) => {
+      this.authProcess = null;
+      if (code === 0) {
+        logger.info(`Manual auth command completed for server '${this.name}', reconnecting`);
+        this.emit("serverUpdated", {
+          server: this.name,
+          reason: "manual_auth_completed",
+          status: ConnectionStatus.CONNECTING,
+        });
+        try {
+          await this.connect();
+          this.emit("serverUpdated", {
+            server: this.name,
+            reason: "manual_auth_reconnected",
+            status: this.status,
+          });
+        } catch (error) {
+          logger.error(
+            "MANUAL_AUTH_RECONNECT_ERROR",
+            `Failed to reconnect server '${this.name}' after manual auth: ${error.message}`,
+            {
+              server: this.name,
+              error: error.message,
+            },
+            false
+          );
+          this.emit("serverUpdated", {
+            server: this.name,
+            reason: "manual_auth_reconnect_failed",
+            status: this.status,
+            error: error.message,
+          });
+        }
+      } else {
+        logger.warn(`Manual auth command exited for server '${this.name}'`, {
+          server: this.name,
+          code,
+          signal,
+        });
+        this.emit("serverUpdated", {
+          server: this.name,
+          reason: "manual_auth_failed",
+          status: this.status,
+          code,
+          signal,
+        });
+      }
+    });
+    this.authCommand = authCommand;
+    return {
+      authCommand,
+      message: `Started manual authorization for server '${this.name}'`,
+    };
   }
 
   _handleUnauthorizedConnection() {

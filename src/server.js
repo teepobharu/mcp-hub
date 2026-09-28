@@ -25,6 +25,92 @@ const app = express();
 app.use(express.json());
 app.use("/api", router);
 
+/**
+ * Shared browser OAuth callback handler.
+ * server_name may come from path (/callback/:server_name) or query (?server_name=).
+ */
+async function handleOAuthBrowserCallback(req, res) {
+  const code = req.query.code;
+  const server_name = req.params.server_name || req.query.server_name;
+
+  try {
+    if (!code || !server_name) {
+      throw new ValidationError("Missing code or server_name parameter");
+    }
+    // Send initial processing page
+    res.write(`
+        <html>
+          <head>
+            <title>MCP HUB</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
+              .loader { border: 5px solid #f3f3f3; border-top: 5px solid #3498db; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin: 20px auto; }
+              @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+              .hidden { display: none; }
+              .message { margin: 20px 0; font-size: 18px; }
+            </style>
+            <script>
+              function updateStatus(status, message) {
+                document.getElementById('processing').style.display = status === 'processing' ? 'block' : 'none';
+                document.getElementById('success').style.display = status === 'success' ? 'block' : 'none';
+                document.getElementById('error').style.display = status === 'error' ? 'block' : 'none';
+                if (message) {
+                  document.getElementById('errorMessage').textContent = message;
+                }
+              }
+            </script>
+          </head>
+          <body>
+            <div id="processing">
+              <h1>MCP HUB</h1>
+              <h2><code>${server_name}<code> Authorization Processing</h2>
+              <div class="loader"></div>
+              <p class="message">Please wait while mcp-hub completes the authorization...</p>
+            </div>
+            <div id="success" class="hidden">
+              <h1>MCP HUB</h1>
+              <h2><code>${server_name}<code> Authorization Successful</h2>
+              <p class="message">Your server has been authorized successfully!</p>
+              <p>You can close this window and return to the application.</p>
+            </div>
+            <div id="error" class="hidden">
+              <h1>MCP HUB</h1>
+              <h2><code>${server_name}<code> Authorization Failed</h2>
+              <p class="message">An error occurred during authorization:</p>
+              <p id="errorMessage" style="color: red;"></p>
+              <p class="message">For errors like 'fetch failed' (serverless hosting might take time to startup), stopping and starting the MCP Server should help. </p>
+            </div>
+          </body>
+        </html>
+      `);
+
+    const connection = serviceManager.mcpHub.getConnection(server_name);
+
+    await connection.handleAuthCallback(code)
+    res.write('<script>updateStatus("success");</script>');
+
+  } catch (error) {
+    logger.error('OAUTH_CALLBACK_ERROR', `Error during OAuth callback: ${error.message}`, {}, false)
+    res.write(`<script>updateStatus("error", "${error.message.replace(/"/g, '\\"')}");</script>`);
+  } finally {
+    // Still broadcast the update for consistency
+    serviceManager.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
+      changes: {
+        modified: [server_name],
+      }
+    });
+    res.end();
+  }
+}
+
+// Gateway-compatible callbacks (not under /api) — see oauth-provider redirectStyle
+app.get("/callback/:server_name", (req, res, next) => {
+  Promise.resolve(handleOAuthBrowserCallback(req, res)).catch(next);
+});
+app.get("/oauth/callback", (req, res, next) => {
+  Promise.resolve(handleOAuthBrowserCallback(req, res)).catch(next);
+});
+
 // Helper to determine HTTP status code from error type
 function getStatusCode(error) {
   if (error instanceof ValidationError) return 400;
@@ -158,6 +244,12 @@ class ServiceManager {
     });
     this.mcpHub.on("devServerRestarted", (data) => {
       this.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, data);
+    });
+    this.mcpHub.on("serverUpdated", (data) => {
+      this.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
+        changes: { modified: [data.server] },
+        ...data,
+      });
     });
 
     // Initialize MCP server endpoint
@@ -838,6 +930,12 @@ registerRoute(
       res.json(result);
     } catch (error) {
       throw wrapError(error, "OPEN_REQUEST_ERROR", error.data || {});
+    } finally {
+      serviceManager.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
+        changes: {
+          modified: [server_name],
+        },
+      });
     }
   }
 )
@@ -925,78 +1023,7 @@ registerRoute(
   "GET",
   "/oauth/callback",
   "Handle OAuth callback",
-  async (req, res) => {
-    const { code, server_name } = req.query;
-
-    try {
-      if (!code || !server_name) {
-        throw new ValidationError("Missing code or server_name parameter");
-      }
-      // Send initial processing page
-      res.write(`
-        <html>
-          <head>
-            <title>MCP HUB</title>
-            <style>
-              body { font-family: Arial, sans-serif; text-align: center; margin-top: 50px; }
-              .loader { border: 5px solid #f3f3f3; border-top: 5px solid #3498db; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin: 20px auto; }
-              @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-              .hidden { display: none; }
-              .message { margin: 20px 0; font-size: 18px; }
-            </style>
-            <script>
-              function updateStatus(status, message) {
-                document.getElementById('processing').style.display = status === 'processing' ? 'block' : 'none';
-                document.getElementById('success').style.display = status === 'success' ? 'block' : 'none';
-                document.getElementById('error').style.display = status === 'error' ? 'block' : 'none';
-                if (message) {
-                  document.getElementById('errorMessage').textContent = message;
-                }
-              }
-            </script>
-          </head>
-          <body>
-            <div id="processing">
-              <h1>MCP HUB</h1>
-              <h2><code>${server_name}<code> Authorization Processing</h2>
-              <div class="loader"></div>
-              <p class="message">Please wait while mcp-hub completes the authorization...</p>
-            </div>
-            <div id="success" class="hidden">
-              <h1>MCP HUB</h1>
-              <h2><code>${server_name}<code> Authorization Successful</h2>
-              <p class="message">Your server has been authorized successfully!</p>
-              <p>You can close this window and return to the application.</p>
-            </div>
-            <div id="error" class="hidden">
-              <h1>MCP HUB</h1>
-              <h2><code>${server_name}<code> Authorization Failed</h2>
-              <p class="message">An error occurred during authorization:</p>
-              <p id="errorMessage" style="color: red;"></p>
-              <p class="message">For errors like 'fetch failed' (serverless hosting might take time to startup), stopping and starting the MCP Server should help. </p>
-            </div>
-          </body>
-        </html>
-      `);
-
-      const connection = serviceManager.mcpHub.getConnection(server_name);
-
-      await connection.handleAuthCallback(code)
-      res.write('<script>updateStatus("success");</script>');
-
-    } catch (error) {
-      logger.error('OAUTH_CALLBACK_ERROR', `Error during OAuth callback: ${error.message}`, {}, false)
-      res.write(`<script>updateStatus("error", "${error.message.replace(/"/g, '\\"')}");</script>`);
-    } finally {
-      // Still broadcast the update for consistency
-      serviceManager.broadcastSubscriptionEvent(SubscriptionTypes.SERVERS_UPDATED, {
-        changes: {
-          modified: [server_name],
-        }
-      });
-      res.end();
-    }
-  }
+  handleOAuthBrowserCallback
 );
 
 

@@ -84,6 +84,9 @@ export class MCPHub extends EventEmitter {
         connection.on("devServerRestarted", (data) => {
           this.emit("devServerRestarted", data);
         });
+        connection.on("serverUpdated", (data) => {
+          this.emit("serverUpdated", data);
+        });
 
         this.connections.set(name, connection);
         await connection.connect();
@@ -242,7 +245,13 @@ export class MCPHub extends EventEmitter {
   async connectServer(name, config) {
     let connection = this.getConnection(name)
     if (!connection) {
-      connection = new MCPConnection(name, config, this.marketplace, this.hubServerUrl);
+      const hubConfig = this.configManager.getConfig() || {};
+      connection = new MCPConnection(name, config, this.marketplace, this.hubServerUrl, {
+        oauth: hubConfig.oauth || {},
+      });
+      connection.on("serverUpdated", (data) => {
+        this.emit("serverUpdated", data);
+      });
       this.connections.set(name, connection);
     }
     await connection.connect(config);
