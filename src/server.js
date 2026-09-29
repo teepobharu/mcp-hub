@@ -17,8 +17,19 @@ import { getMarketplace } from "./marketplace.js";
 import { MCPServerEndpoint } from "./mcp/server.js";
 import { MCPProxyEndpoint } from "./mcp/proxy.js";
 import { WorkspaceCacheManager } from "./utils/workspace-cache.js";
+import { buildInfo, getHealthBuildInfo } from "./utils/build-info.js";
 
 const SERVER_ID = "mcp-hub";
+
+export function parseOAuthCallbackUrl(rawUrl) {
+  const url = new URL(rawUrl);
+  const pathMatch = url.pathname.match(/\/callback\/([^/]+)\/?$/);
+  return {
+    code: url.searchParams.get('code'),
+    server_name: url.searchParams.get('server_name') ||
+      (pathMatch ? decodeURIComponent(pathMatch[1]) : null),
+  };
+}
 
 // Create Express app
 const app = express();
@@ -660,6 +671,7 @@ registerRoute("GET", "/health", "Check server health", async (req, res) => {
     state: serviceManager?.state || HubState.STARTING,
     server_id: SERVER_ID,
     version: process.env.VERSION,
+    build: getHealthBuildInfo(),
     activeClients: serviceManager?.sseManager?.connections.size || 0,
     timestamp: new Date().toISOString(),
     servers: serviceManager?.mcpHub?.getAllServerStatuses() || [],
@@ -687,6 +699,50 @@ registerRoute("GET", "/health", "Check server health", async (req, res) => {
   }
 
   res.json(healthData);
+});
+
+registerRoute("GET", "/build-info", "Inspect the running hub build and runtime", (req, res) => {
+  const configured = serviceManager?.config;
+  const configPaths = Array.isArray(configured) ? configured : configured ? [configured] : [];
+  res.json({
+    build: buildInfo,
+    runtime: {
+      pid: process.pid,
+      node: process.version,
+      platform: process.platform,
+      binaryPath: process.argv[1] || null,
+      cwd: process.cwd(),
+      configPath: configPaths[0] || null,
+      configPaths,
+      port: serviceManager?.port || null,
+      startedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+      uptimeMs: Math.round(process.uptime() * 1000),
+      watch: serviceManager?.watch ?? null,
+      autoShutdown: serviceManager?.autoShutdown ?? null,
+      shutdownDelay: serviceManager?.shutdownDelay ?? null,
+    },
+  });
+});
+
+// A deliberate stop is distinct from /hard-restart: broadcast STOPPING, reply
+// before terminating, and never emit RESTARTING for clients to reconnect to.
+registerRoute("POST", "/stop", "Stop the current MCP Hub process", (req, res) => {
+  const peer = req.socket.remoteAddress;
+  const isLocal = peer === "127.0.0.1" || peer === "::1" || peer === "::ffff:127.0.0.1";
+  if (!isLocal || req.get("X-MCPHub-Action") !== "stop") {
+    return res.status(403).json({ error: "Local confirmed stop request required" });
+  }
+  if (!serviceManager) {
+    return res.status(503).json({ error: "MCP Hub is not running" });
+  }
+  if (serviceManager.state === HubState.STOPPING || serviceManager.state === HubState.STOPPED) {
+    return res.status(409).json({ error: "MCP Hub is already stopping" });
+  }
+  serviceManager.setState(HubState.STOPPING);
+  res.once("finish", () => {
+    setImmediate(() => process.emit("SIGTERM"));
+  });
+  res.json({ status: "stopping", pid: process.pid, timestamp: new Date().toISOString() });
 });
 
 // Register server list endpoint
@@ -986,13 +1042,7 @@ registerRoute(
       if (!url) {
         throw new ValidationError("Missing URL parameter", { field: "url" });
       }
-      const url_with_code = new URL(url)
-      if (url_with_code.searchParams.has('code')) {
-        code = url_with_code.searchParams.get('code')
-      }
-      if (url_with_code.searchParams.has('server_name')) {
-        server_name = url_with_code.searchParams.get('server_name')
-      }
+      ({ code, server_name } = parseOAuthCallbackUrl(url))
       if (!code || !server_name) {
         throw new ValidationError("Missing code or server_name parameter");
       }

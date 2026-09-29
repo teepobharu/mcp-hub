@@ -3,6 +3,7 @@ mcphub.nvim/
 .env
 *.tgz
 dist/
+PATCHES.json
 *.avanterules
 *.log
 .r*
